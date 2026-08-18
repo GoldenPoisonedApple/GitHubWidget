@@ -17,6 +17,8 @@
 //   - 表示週数: config.txt 2行目で直近 n 週に限定(デフォルト10)。全週データは保持し描画時に末尾スライス。
 //   - 終了手段: 右上の赤ボタン。タスクバー非表示(WS_EX_TOOLWINDOW)のため明示的UIが必要。
 //   - 位置永続化: config.txt 3-4行目に終了時の座標を保存し、次回起動時に復元する。
+//   - Zオーダー: WS_EX_TOPMOST は使わない。他ウィンドウの背面に回る通常の常駐ウィジェットとする。
+//   - 更新中表示: 非同期取得中は更新ボタン左に水色インジケータを出し、無反応と誤認を防ぐ。
 //
 // ビルド方法は BUILD.md 参照。
 // ============================================================================
@@ -51,6 +53,8 @@ constexpr UINT TIMER_INTERVAL_MS  = 60 * 60 * 1000; // 1時間。非公式APIへ
 constexpr int DEFAULT_DISPLAY_WEEKS = 10; // config.txt 2行目省略時の表示週数。53週全表示は画面占有が大きいためデフォルトを絞る。
 constexpr COLORREF COLOR_BTN_REFRESH = RGB(0, 180, 0);   // 更新ボタン。LEVEL_COLORS/COLOR_KEY と衝突しない純色を選ぶ。
 constexpr COLORREF COLOR_BTN_CLOSE   = RGB(255, 0, 0);   // 終了ボタン。視認性のため GitHub 配色とは別系統にする。
+constexpr COLORREF COLOR_LOADING     = RGB(135, 206, 235); // 更新中インジケータ(水色)。取得完了まで緑ボタン左に表示する。
+constexpr DWORD HTTP_TIMEOUT_MS      = 30000; // WinHTTP 各段階の上限。未設定だと応答待ちで fetchInFlight が降りず水色が残り続ける。
 
 // data-level(0-4) -> 表示色。GitHubデフォルト(ライトテーマ)の配色に準拠。
 // 任意の値に変更可能(ダークテーマ配色に合わせる場合はここを書き換える)。
@@ -78,6 +82,7 @@ struct AppState {
     std::vector<int> levels; // 各セルのレベル(0-4)。サイズ = 取得できたセル数(最大 GRID_WEEKS*GRID_DAYS)
     std::wstring username;
     int displayWeeks = DEFAULT_DISPLAY_WEEKS; // 描画・ウィンドウ幅・ヒットテストで共有する表示週数
+    int fetchInFlight = 0; // 進行中の非同期取得数。UIスレッドのみ更新。>0 の間、水色インジケータを表示する。
 };
 
 AppState g_state;
@@ -205,6 +210,13 @@ void GetControlButtonRects(int displayWeeks, RECT& greenRect, RECT& redRect) {
     redRect   = { redCol * pitch, 0, redCol * pitch + CELL_SIZE, CELL_SIZE };
 }
 
+void GetLoadingIndicatorRect(int displayWeeks, RECT& loadingRect) {
+    int pitch = GetCellPitch();
+    // 緑ボタンの1列左。並行取得時も位置を固定し、ユーザーが「更新中」を認識しやすくする。
+    int loadingCol = std::max(0, displayWeeks - 3);
+    loadingRect = { loadingCol * pitch, 0, loadingCol * pitch + CELL_SIZE, CELL_SIZE };
+}
+
 // ----------------------------------------------------------------------------
 // WinHTTPによるHTTPS GET
 //
@@ -226,6 +238,9 @@ std::string HttpsGet(const std::wstring& host, const std::wstring& path) {
         WINHTTP_NO_PROXY_BYPASS,
         0);
     if (!hSession) return response;
+
+    // タイムアウト未設定時は WinHTTP が長時間ブロックし、UI側の fetchInFlight が降りない。
+    WinHttpSetTimeouts(hSession, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS, HTTP_TIMEOUT_MS);
 
     HINTERNET hConnect = WinHttpConnect(hSession, host.c_str(), INTERNET_DEFAULT_HTTPS_PORT, 0);
     if (!hConnect) {
@@ -297,17 +312,36 @@ bool ParseContributionLevels(const std::string& html, std::vector<int>& outLevel
 // UIスレッドをブロックしないよう std::thread で分離し、完了後に
 // PostMessage で結果ポインタをUIスレッドへ引き渡す(GDI呼び出しはUIスレッド側でのみ行う)。
 // ----------------------------------------------------------------------------
-void FetchContributionsAsync(HWND hwnd, std::wstring username) {
-    std::thread([hwnd, username]() {
-        std::wstring path = L"/users/" + username + L"/contributions";
-        std::string html = HttpsGet(L"github.com", path);
+void NotifyFetchCompleted(HWND hwnd, std::vector<int>* result) {
+    if (!IsWindow(hwnd)) {
+        delete result;
+        return;
+    }
+    // PostMessage 失敗時も fetchInFlight を必ず降ろす。失敗しないと水色が点灯し続ける。
+    if (!PostMessage(hwnd, WM_CONTRIB_UPDATED, 0, reinterpret_cast<LPARAM>(result))) {
+        delete result;
+        SendMessage(hwnd, WM_CONTRIB_UPDATED, 0, 0);
+    }
+}
 
+void FetchContributionsAsync(HWND hwnd, std::wstring username) {
+    // UIスレッド上で開始を記録し、取得完了(WM_CONTRIB_UPDATED)まで水色インジケータを点灯する。
+    g_state.fetchInFlight++;
+    InvalidateRect(hwnd, nullptr, FALSE);
+
+    std::thread([hwnd, username]() {
         auto* result = new std::vector<int>();
-        if (!html.empty()) {
-            ParseContributionLevels(html, *result);
+        try {
+            std::wstring path = L"/users/" + username + L"/contributions";
+            std::string html = HttpsGet(L"github.com", path);
+            if (!html.empty()) {
+                ParseContributionLevels(html, *result);
+            }
+        } catch (...) {
+            // パース例外等でも UI 側へ完了通知は必ず送る。通知漏れはインジケータ残留の直接原因になる。
+            result->clear();
         }
-        // 取得失敗時は空のvectorがそのまま渡る。WndProc側で「空なら現状維持」を判断する。
-        PostMessage(hwnd, WM_CONTRIB_UPDATED, 0, reinterpret_cast<LPARAM>(result));
+        NotifyFetchCompleted(hwnd, result);
     }).detach();
 }
 
@@ -316,7 +350,7 @@ void FetchContributionsAsync(HWND hwnd, std::wstring username) {
 // 背景はウィンドウクラスの hbrBackground(COLOR_KEY色)で WM_ERASEBKGND 側にて塗り潰し済み。
 // 全週データは g_state.levels に保持し、ここで末尾スライスのみ描画する(再取得なしで週数変更にも対応しやすい)。
 // ----------------------------------------------------------------------------
-void PaintGrid(HDC hdc, const std::vector<int>& levels, int displayWeeks) {
+void PaintGrid(HDC hdc, const std::vector<int>& levels, int displayWeeks, bool showLoading) {
     int pitch = GetCellPitch();
     int gridOriginY = GetGridOriginY();
     int totalWeeks = static_cast<int>(levels.size()) / GRID_DAYS;
@@ -337,6 +371,20 @@ void PaintGrid(HDC hdc, const std::vector<int>& levels, int displayWeeks) {
             FillRect(hdc, &cell, brush);
             DeleteObject(brush);
         }
+    }
+
+    RECT loadingRect;
+    GetLoadingIndicatorRect(displayWeeks, loadingRect);
+    if (showLoading) {
+        HBRUSH loadingBrush = CreateSolidBrush(COLOR_LOADING);
+        FillRect(hdc, &loadingRect, loadingBrush);
+        DeleteObject(loadingBrush);
+    } else {
+        // InvalidateRect(..., FALSE) では WM_ERASEBKGND が走らず、前フレームの水色が残る。
+        // 取得完了後は COLOR_KEY で明示的に上書きし、透過領域として消す。
+        HBRUSH keyBrush = CreateSolidBrush(COLOR_KEY);
+        FillRect(hdc, &loadingRect, keyBrush);
+        DeleteObject(keyBrush);
     }
 
     RECT greenRect, redRect;
@@ -379,19 +427,24 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             if (!newLevels->empty()) {
                 std::lock_guard<std::mutex> lock(g_state.dataMutex);
                 g_state.levels = *newLevels;
-                InvalidateRect(hwnd, nullptr, FALSE); // FALSE: 背景の再消去は不要(内容は同一形状で上書きされる)
             }
             delete newLevels;
         }
+        // 取得成功/失敗に関わらずインジケータを消灯。空結果でも再描画しないと水色が残る。
+        if (g_state.fetchInFlight > 0) {
+            g_state.fetchInFlight--;
+        }
+        InvalidateRect(hwnd, nullptr, FALSE);
         return 0;
     }
 
     case WM_PAINT: {
         PAINTSTRUCT ps;
         HDC hdc = BeginPaint(hwnd, &ps);
+        const bool showLoading = g_state.fetchInFlight > 0;
         {
             std::lock_guard<std::mutex> lock(g_state.dataMutex);
-            PaintGrid(hdc, g_state.levels, g_state.displayWeeks);
+            PaintGrid(hdc, g_state.levels, g_state.displayWeeks, showLoading);
         }
         EndPaint(hwnd, &ps);
         return 0;
@@ -488,13 +541,13 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     // dwExStyle:
     //   WS_EX_LAYERED    - レイヤードウィンドウ化(透過処理の前提)
-    //   WS_EX_TOPMOST    - 常に最前面表示
     //   WS_EX_TOOLWINDOW - タスクバー・Alt+Tab一覧から除外
+    // WS_EX_TOPMOST は付与しない。他ウィンドウの背面に回る通常 Z オーダーとする。
     // dwStyle:
     //   WS_POPUP のみを指定し、WS_CAPTION/WS_THICKFRAME/WS_SYSMENU を含めない
     //   -> タイトルバー・システムメニュー・サイズ変更枠が一切描画されない
     HWND hwnd = CreateWindowExW(
-        WS_EX_LAYERED | WS_EX_TOPMOST | WS_EX_TOOLWINDOW,
+        WS_EX_LAYERED | WS_EX_TOOLWINDOW,
         className, L"", WS_POPUP,
         x, y, width, height,
         nullptr, nullptr, hInstance, nullptr);
