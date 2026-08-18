@@ -8,13 +8,17 @@
 //        DIBセクションの手動管理コストを払う理由がない。
 //   - データ取得: GitHub GraphQL API(要トークン)は使用しない。
 //     https://github.com/users/{username}/contributions の非公式HTML断片を
-//     認証なしGETで取得し、data-level属性(0-4)を正規表現で抽出する。
+//     認証なしGETで取得し、data-date + data-level を正規表現で抽出する。
 //     -> トークン管理という不要な複雑性・セキュリティ露出を排除する設計判断。
 //        ただし非公開APIであるため、構造変更・レート制限のリスクは残る。
+//     (旧実装は data-level の出現順を「週0の日0-6...」とみなしていたが、
+//      HTMLは行=曜日(Sun→Sat)・列=週の表構造のため日付ベース配置に変更した。)
+//   - 格子配置: 行0=日曜、右端列=今週。data-date から (週列, 曜日行) を算出する。
+//   - 未来日: 明日以降(date > today)は描画せず透過。今日までは level 0 含め表示。
+//   - 表示週数: config.txt 2行目で直近 n 週に限定(デフォルト10)。右端を今週として左へ n 週分。
 //   - ドラッグ移動: WM_NCHITTEST で HTCAPTION を返し、DWM既定の移動処理に委譲。
 //     手動マウス追跡(WM_LBUTTONDOWN/WM_MOUSEMOVE)より実装・実行コストが低い。
 //     操作ボタン(緑=更新・赤=終了)領域のみ HTCLIENT に戻し、クリックを受け付ける。
-//   - 表示週数: config.txt 2行目で直近 n 週に限定(デフォルト10)。全週データは保持し描画時に末尾スライス。
 //   - 終了手段: 右上の赤ボタン。タスクバー非表示(WS_EX_TOOLWINDOW)のため明示的UIが必要。
 //   - 位置永続化: config.txt 3-4行目に終了時の座標を保存し、次回起動時に復元する。
 //   - Zオーダー: WS_EX_TOPMOST は使わない。他ウィンドウの背面に回る通常の常駐ウィジェットとする。
@@ -36,8 +40,11 @@
 #include <fstream>
 #include <sstream>
 #include <algorithm>
+#include <unordered_map>
 
 #pragma comment(lib, "winhttp.lib")
+
+using ContributionMap = std::unordered_map<int, int>; // key=YYYYMMDD, value=data-level(0-4)
 
 // ----------------------------------------------------------------------------
 // 定数
@@ -79,7 +86,7 @@ struct AppConfig {
 
 struct AppState {
     std::mutex dataMutex;
-    std::vector<int> levels; // 各セルのレベル(0-4)。サイズ = 取得できたセル数(最大 GRID_WEEKS*GRID_DAYS)
+    ContributionMap levelsByDate; // 日付(YYYYMMDD) -> level(0-4)。描画時に週×曜日へ配置する。
     std::wstring username;
     int displayWeeks = DEFAULT_DISPLAY_WEEKS; // 描画・ウィンドウ幅・ヒットテストで共有する表示週数
     int fetchInFlight = 0; // 進行中の非同期取得数。UIスレッドのみ更新。>0 の間、水色インジケータを表示する。
@@ -289,20 +296,85 @@ std::string HttpsGet(const std::wstring& host, const std::wstring& path) {
 }
 
 // ----------------------------------------------------------------------------
-// data-level="N" を出現順に抽出する。
+// 日付ユーティリティ (ローカル日付。GitHub プロフィール表示と同じ前提)
+// YYYYMMDD 整数キーで map と比較・加算を単純化する。
+// ----------------------------------------------------------------------------
+int YmdFromIso(const std::string& iso) {
+    if (iso.size() < 10) return 0;
+    return std::stoi(iso.substr(0, 4)) * 10000
+         + std::stoi(iso.substr(5, 2)) * 100
+         + std::stoi(iso.substr(8, 2));
+}
+
+SYSTEMTIME YmdToSystemTime(int ymd) {
+    SYSTEMTIME st{};
+    st.wYear = static_cast<WORD>(ymd / 10000);
+    st.wMonth = static_cast<WORD>((ymd / 100) % 100);
+    st.wDay = static_cast<WORD>(ymd % 100);
+    return st;
+}
+
+int SystemTimeToYmd(const SYSTEMTIME& st) {
+    return static_cast<int>(st.wYear) * 10000
+         + static_cast<int>(st.wMonth) * 100
+         + static_cast<int>(st.wDay);
+}
+
+int GetTodayYmd() {
+    SYSTEMTIME st{};
+    GetLocalTime(&st);
+    return SystemTimeToYmd(st);
+}
+
+int AddDays(int ymd, int days) {
+    SYSTEMTIME st = YmdToSystemTime(ymd);
+    FILETIME ft{};
+    SystemTimeToFileTime(&st, &ft);
+    ULARGE_INTEGER uli{};
+    uli.LowPart = ft.dwLowDateTime;
+    uli.HighPart = ft.dwHighDateTime;
+    uli.QuadPart += static_cast<ULONGLONG>(days) * 864000000000ULL;
+    ft.dwLowDateTime = uli.LowPart;
+    ft.dwHighDateTime = uli.HighPart;
+    SYSTEMTIME out{};
+    FileTimeToSystemTime(&ft, &out);
+    return SystemTimeToYmd(out);
+}
+
+int GetSundayOfWeek(int ymd) {
+    SYSTEMTIME st = YmdToSystemTime(ymd);
+    FILETIME ft{};
+    SystemTimeToFileTime(&st, &ft);
+    SYSTEMTIME local{};
+    FileTimeToSystemTime(&ft, &local);
+    // wDayOfWeek: 0=日曜。GitHub 格子の最上段(行0)と揃えるため日曜起点で週を切る。
+    return AddDays(ymd, -static_cast<int>(local.wDayOfWeek));
+}
+
+// ----------------------------------------------------------------------------
+// data-date + data-level を同一 td 要素から抽出する。
 // 出現順はHTML内での日付昇順(古い日付が先)であり、これをそのまま
 // 「週インデックス優先(週0の日0-6, 週1の日0-6, ...)」の格納順として扱う。
+// -> 上記仮定は HTML 表構造(行=曜日)と一致しないため、日付キー map へ変更した。
 // ----------------------------------------------------------------------------
-bool ParseContributionLevels(const std::string& html, std::vector<int>& outLevels) {
+bool ParseContributions(const std::string& html, ContributionMap& outLevels) {
     outLevels.clear();
-    static const std::regex re("data-level=\"(\\d)\"");
-    auto begin = std::sregex_iterator(html.begin(), html.end(), re);
-    auto end   = std::sregex_iterator();
-    for (auto it = begin; it != end; ++it) {
-        int level = std::stoi((*it)[1].str());
-        if (level < 0) level = 0;
-        if (level > 4) level = 4;
-        outLevels.push_back(level);
+    static const std::regex reDateFirst("data-date=\"(\\d{4}-\\d{2}-\\d{2})\"[^>]*data-level=\"(\\d)\"");
+    static const std::regex reLevelFirst("data-level=\"(\\d)\"[^>]*data-date=\"(\\d{4}-\\d{2}-\\d{2})\"");
+
+    auto ingest = [&outLevels](const std::smatch& m, bool dateFirst) {
+        int ymd = dateFirst ? YmdFromIso(m[1].str()) : YmdFromIso(m[2].str());
+        if (ymd == 0) return;
+        int level = std::stoi(dateFirst ? m[2].str() : m[1].str());
+        level = std::clamp(level, 0, 4);
+        outLevels[ymd] = level;
+    };
+
+    for (auto it = std::sregex_iterator(html.begin(), html.end(), reDateFirst); it != std::sregex_iterator(); ++it) {
+        ingest(*it, true);
+    }
+    for (auto it = std::sregex_iterator(html.begin(), html.end(), reLevelFirst); it != std::sregex_iterator(); ++it) {
+        ingest(*it, false);
     }
     return !outLevels.empty();
 }
@@ -312,7 +384,7 @@ bool ParseContributionLevels(const std::string& html, std::vector<int>& outLevel
 // UIスレッドをブロックしないよう std::thread で分離し、完了後に
 // PostMessage で結果ポインタをUIスレッドへ引き渡す(GDI呼び出しはUIスレッド側でのみ行う)。
 // ----------------------------------------------------------------------------
-void NotifyFetchCompleted(HWND hwnd, std::vector<int>* result) {
+void NotifyFetchCompleted(HWND hwnd, ContributionMap* result) {
     if (!IsWindow(hwnd)) {
         delete result;
         return;
@@ -330,12 +402,12 @@ void FetchContributionsAsync(HWND hwnd, std::wstring username) {
     InvalidateRect(hwnd, nullptr, FALSE);
 
     std::thread([hwnd, username]() {
-        auto* result = new std::vector<int>();
+        auto* result = new ContributionMap();
         try {
             std::wstring path = L"/users/" + username + L"/contributions";
             std::string html = HttpsGet(L"github.com", path);
             if (!html.empty()) {
-                ParseContributionLevels(html, *result);
+                ParseContributions(html, *result);
             }
         } catch (...) {
             // パース例外等でも UI 側へ完了通知は必ず送る。通知漏れはインジケータ残留の直接原因になる。
@@ -348,25 +420,33 @@ void FetchContributionsAsync(HWND hwnd, std::wstring username) {
 // ----------------------------------------------------------------------------
 // 描画: 直近 displayWeeks 週の格子 + 操作ボタンをクライアント領域に塗る。
 // 背景はウィンドウクラスの hbrBackground(COLOR_KEY色)で WM_ERASEBKGND 側にて塗り潰し済み。
-// 全週データは g_state.levels に保持し、ここで末尾スライスのみ描画する(再取得なしで週数変更にも対応しやすい)。
+// levelsByDate を日付から (週列, 曜日行) へ配置。右端列=今週、行0=日曜。
 // ----------------------------------------------------------------------------
-void PaintGrid(HDC hdc, const std::vector<int>& levels, int displayWeeks, bool showLoading) {
+void PaintGrid(HDC hdc, const ContributionMap& levelsByDate, int displayWeeks, bool showLoading) {
     int pitch = GetCellPitch();
     int gridOriginY = GetGridOriginY();
-    int totalWeeks = static_cast<int>(levels.size()) / GRID_DAYS;
-    // 取得週数が displayWeeks 未満の場合は先頭から描画(データ不足時の安全側フォールバック)。
-    int startWeek = (totalWeeks > displayWeeks) ? (totalWeeks - displayWeeks) : 0;
+    const int today = GetTodayYmd();
+    const int currentWeekSunday = GetSundayOfWeek(today);
+    const int startSunday = AddDays(currentWeekSunday, -(displayWeeks - 1) * 7);
 
     for (int w = 0; w < displayWeeks; ++w) {
         for (int d = 0; d < GRID_DAYS; ++d) {
-            size_t srcIndex = static_cast<size_t>((startWeek + w) * GRID_DAYS + d);
-            if (srcIndex >= levels.size()) continue;
+            const int cellDate = AddDays(startSunday, w * 7 + d);
+            if (cellDate > today) {
+                // 明日以降は GitHub と同様に空(透過)。COLOR_KEY のまま描画しない。
+                continue;
+            }
 
-            int x = w * pitch;
-            int y = gridOriginY + d * pitch;
+            int level = 0;
+            const auto it = levelsByDate.find(cellDate);
+            if (it != levelsByDate.end()) {
+                level = it->second;
+            }
+
+            const int x = w * pitch;
+            const int y = gridOriginY + d * pitch;
             RECT cell{ x, y, x + CELL_SIZE, y + CELL_SIZE };
 
-            int level = levels[srcIndex];
             HBRUSH brush = CreateSolidBrush(LEVEL_COLORS[level]);
             FillRect(hdc, &cell, brush);
             DeleteObject(brush);
@@ -422,11 +502,11 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     }
 
     case WM_CONTRIB_UPDATED: {
-        auto* newLevels = reinterpret_cast<std::vector<int>*>(lParam);
+        auto* newLevels = reinterpret_cast<ContributionMap*>(lParam);
         if (newLevels != nullptr) {
             if (!newLevels->empty()) {
                 std::lock_guard<std::mutex> lock(g_state.dataMutex);
-                g_state.levels = *newLevels;
+                g_state.levelsByDate = *newLevels;
             }
             delete newLevels;
         }
@@ -444,7 +524,7 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         const bool showLoading = g_state.fetchInFlight > 0;
         {
             std::lock_guard<std::mutex> lock(g_state.dataMutex);
-            PaintGrid(hdc, g_state.levels, g_state.displayWeeks, showLoading);
+            PaintGrid(hdc, g_state.levelsByDate, g_state.displayWeeks, showLoading);
         }
         EndPaint(hwnd, &ps);
         return 0;
