@@ -186,6 +186,20 @@ bool SaveWindowPosition(int x, int y, int displayWeeks, const std::wstring& user
 }
 
 // ----------------------------------------------------------------------------
+// 作業ディレクトリを exe 配置フォルダへ合わせる。
+// スタートアップやショートカット起動時に cwd が System32 等になり config.txt が
+// 見つからない問題を防ぐ。config.txt は常に exe と同じ場所を参照する設計とする。
+// ----------------------------------------------------------------------------
+void SetWorkingDirectoryToExe() {
+    wchar_t path[MAX_PATH]{};
+    if (GetModuleFileNameW(nullptr, path, MAX_PATH) == 0) return;
+    wchar_t* slash = wcsrchr(path, L'\\');
+    if (slash == nullptr) return;
+    *slash = L'\0';
+    SetCurrentDirectoryW(path);
+}
+
+// ----------------------------------------------------------------------------
 // レイアウト計算
 // 描画・ヒットテスト・CreateWindowExW で同じ式を使い、座標ずれを防ぐ。
 // ----------------------------------------------------------------------------
@@ -577,6 +591,8 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // エントリポイント
 // ----------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
+
+    SetWorkingDirectoryToExe();
 
     AppConfig config;
     if (!LoadConfig(config)) {

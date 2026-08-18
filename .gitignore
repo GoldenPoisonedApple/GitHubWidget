@@ -1,2 +1,11 @@
+# ビルド成果物
 *.exe
+*.o
+*.obj
 *.lnk
+
+# ユーザー固有設定（リポジトリには example のみ載せる）
+config.txt
+
+# デバッグログ
+debug-*.log
