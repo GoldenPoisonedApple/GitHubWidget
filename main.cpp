@@ -13,6 +13,10 @@
 //        ただし非公開APIであるため、構造変更・レート制限のリスクは残る。
 //   - ドラッグ移動: WM_NCHITTEST で HTCAPTION を返し、DWM既定の移動処理に委譲。
 //     手動マウス追跡(WM_LBUTTONDOWN/WM_MOUSEMOVE)より実装・実行コストが低い。
+//     操作ボタン(緑=更新・赤=終了)領域のみ HTCLIENT に戻し、クリックを受け付ける。
+//   - 表示週数: config.txt 2行目で直近 n 週に限定(デフォルト10)。全週データは保持し描画時に末尾スライス。
+//   - 終了手段: 右上の赤ボタン。タスクバー非表示(WS_EX_TOOLWINDOW)のため明示的UIが必要。
+//   - 位置永続化: config.txt 3-4行目に終了時の座標を保存し、次回起動時に復元する。
 //
 // ビルド方法は BUILD.md 参照。
 // ============================================================================
@@ -20,6 +24,7 @@
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#include <windowsx.h>
 #include <winhttp.h>
 #include <string>
 #include <vector>
@@ -28,6 +33,7 @@
 #include <mutex>
 #include <fstream>
 #include <sstream>
+#include <algorithm>
 
 #pragma comment(lib, "winhttp.lib")
 
@@ -42,6 +48,9 @@ constexpr COLORREF COLOR_KEY = RGB(1, 1, 1); // 透過色キー。描画内容�
 constexpr UINT WM_CONTRIB_UPDATED = WM_APP + 1; // 取得スレッドからUIスレッドへの更新通知
 constexpr UINT TIMER_ID_REFRESH   = 1;
 constexpr UINT TIMER_INTERVAL_MS  = 60 * 60 * 1000; // 1時間。非公式APIへの過度なポーリングを避ける。
+constexpr int DEFAULT_DISPLAY_WEEKS = 10; // config.txt 2行目省略時の表示週数。53週全表示は画面占有が大きいためデフォルトを絞る。
+constexpr COLORREF COLOR_BTN_REFRESH = RGB(0, 180, 0);   // 更新ボタン。LEVEL_COLORS/COLOR_KEY と衝突しない純色を選ぶ。
+constexpr COLORREF COLOR_BTN_CLOSE   = RGB(255, 0, 0);   // 終了ボタン。視認性のため GitHub 配色とは別系統にする。
 
 // data-level(0-4) -> 表示色。GitHubデフォルト(ライトテーマ)の配色に準拠。
 // 任意の値に変更可能(ダークテーマ配色に合わせる場合はここを書き換える)。
@@ -56,27 +65,144 @@ const COLORREF LEVEL_COLORS[5] = {
 // ----------------------------------------------------------------------------
 // アプリケーション状態
 // ----------------------------------------------------------------------------
+struct AppConfig {
+    std::wstring username;
+    int displayWeeks = DEFAULT_DISPLAY_WEEKS;
+    int windowX = 0;
+    int windowY = 0;
+    bool hasSavedPosition = false; // 3-4行目が有効な整数として読めた場合のみ true。未保存時は右上デフォルトを使う。
+};
+
 struct AppState {
     std::mutex dataMutex;
     std::vector<int> levels; // 各セルのレベル(0-4)。サイズ = 取得できたセル数(最大 GRID_WEEKS*GRID_DAYS)
     std::wstring username;
+    int displayWeeks = DEFAULT_DISPLAY_WEEKS; // 描画・ウィンドウ幅・ヒットテストで共有する表示週数
 };
 
 AppState g_state;
 
 // ----------------------------------------------------------------------------
-// 設定ファイル読み込み(config.txt: 1行目にGitHubユーザー名)
-// PAT等の認証情報は不要な設計のため、設定項目はユーザー名のみ。
+// 設定ファイル入出力
+//
+// config.txt 形式:
+//   1行目: GitHubユーザー名(必須)
+//   2行目: 表示週数 n(省略時 DEFAULT_DISPLAY_WEEKS、1〜GRID_WEEKS にクランプ)
+//   3行目: ウィンドウ X(省略可。終了時に自動書き込み)
+//   4行目: ウィンドウ Y(省略可。終了時に自動書き込み)
+// PAT等の認証情報は不要な設計のため、ユーザー名以外は表示・配置に関する項目のみ。
 // ----------------------------------------------------------------------------
-bool LoadConfig(std::wstring& username) {
+void TrimLineEnd(std::wstring& line) {
+    // 改行コードCRLFの'\r'混入対策。Windows のテキストエディタ互換のため。
+    while (!line.empty() && (line.back() == L'\r' || line.back() == L'\n')) {
+        line.pop_back();
+    }
+}
+
+bool LoadConfig(AppConfig& config) {
     std::wifstream f(L"config.txt");
     if (!f.is_open()) return false;
-    std::getline(f, username);
-    // 改行コードCRLFの'\r'混入対策
-    while (!username.empty() && (username.back() == L'\r' || username.back() == L'\n')) {
-        username.pop_back();
+
+    if (!std::getline(f, config.username)) return false;
+    TrimLineEnd(config.username);
+    if (config.username.empty()) return false;
+
+    std::wstring line;
+    if (std::getline(f, line)) {
+        TrimLineEnd(line);
+        if (!line.empty()) {
+            try {
+                // 週数は API 取得上限(53)を超えないようクランプ。過大値はウィンドウ幅肥大化を防ぐ。
+                int n = std::stoi(line);
+                config.displayWeeks = std::clamp(n, 1, GRID_WEEKS);
+            } catch (...) {
+                // パース失敗時は DEFAULT_DISPLAY_WEEKS のまま。起動不能にしない。
+            }
+        }
     }
-    return !username.empty();
+
+    std::wstring lineX, lineY;
+    if (std::getline(f, lineX) && std::getline(f, lineY)) {
+        TrimLineEnd(lineX);
+        TrimLineEnd(lineY);
+        if (!lineX.empty() && !lineY.empty()) {
+            try {
+                config.windowX = std::stoi(lineX);
+                config.windowY = std::stoi(lineY);
+                config.hasSavedPosition = true;
+            } catch (...) {
+                // 座標行が壊れていても起動は続行。デフォルト位置にフォールバックする。
+            }
+        }
+    }
+
+    return true;
+}
+
+bool SaveWindowPosition(int x, int y, int displayWeeks, const std::wstring& username) {
+    // 終了時のみ呼ぶ。ドラッグ中の逐次書き込みは I/O 負荷とファイル破損リスクを避けるため行わない。
+    std::vector<std::wstring> lines;
+    {
+        std::wifstream f(L"config.txt");
+        if (f.is_open()) {
+            std::wstring line;
+            while (std::getline(f, line)) {
+                lines.push_back(line);
+            }
+        }
+    }
+
+    if (lines.empty()) lines.push_back(username);
+    else lines[0] = username;
+
+    if (lines.size() < 2) lines.push_back(std::to_wstring(displayWeeks));
+    else lines[1] = std::to_wstring(displayWeeks);
+
+    while (lines.size() < 3) lines.push_back(L"");
+    while (lines.size() < 4) lines.push_back(L"");
+
+    lines[2] = std::to_wstring(x);
+    lines[3] = std::to_wstring(y);
+
+    std::wofstream out(L"config.txt");
+    if (!out.is_open()) return false;
+    for (size_t i = 0; i < lines.size(); ++i) {
+        out << lines[i];
+        if (i + 1 < lines.size()) out << L"\n";
+    }
+    return true;
+}
+
+// ----------------------------------------------------------------------------
+// レイアウト計算
+// 描画・ヒットテスト・CreateWindowExW で同じ式を使い、座標ずれを防ぐ。
+// ----------------------------------------------------------------------------
+int GetCellPitch() {
+    return CELL_SIZE + CELL_GAP;
+}
+
+int GetWindowContentWidth(int displayWeeks) {
+    // 幅は格子 n 週分のみ。ボタンは格子幅内の最右2列位置に上段へ重ねる(横に伸ばさない)。
+    return displayWeeks * GetCellPitch();
+}
+
+int GetWindowContentHeight() {
+    // 上段1行(操作ボタン) + 格子7日分。ボタン行と格子行を分離して視認性を確保する。
+    return (GRID_DAYS + 1) * GetCellPitch();
+}
+
+int GetGridOriginY() {
+    // 格子はボタン行の直下から開始。y=0 は操作ボタン専用行として空けておく。
+    return GetCellPitch();
+}
+
+void GetControlButtonRects(int displayWeeks, RECT& greenRect, RECT& redRect) {
+    int pitch = GetCellPitch();
+    // 格子最右2列と同じ x 座標に [緑][赤] を配置し、上段右寄せの見た目にする。
+    int greenCol = std::max(0, displayWeeks - 2);
+    int redCol   = std::max(0, displayWeeks - 1);
+    greenRect = { greenCol * pitch, 0, greenCol * pitch + CELL_SIZE, CELL_SIZE };
+    redRect   = { redCol * pitch, 0, redCol * pitch + CELL_SIZE, CELL_SIZE };
 }
 
 // ----------------------------------------------------------------------------
@@ -186,24 +312,41 @@ void FetchContributionsAsync(HWND hwnd, std::wstring username) {
 }
 
 // ----------------------------------------------------------------------------
-// 描画: グリッド全体をクライアント領域に塗る。
+// 描画: 直近 displayWeeks 週の格子 + 操作ボタンをクライアント領域に塗る。
 // 背景はウィンドウクラスの hbrBackground(COLOR_KEY色)で WM_ERASEBKGND 側にて塗り潰し済み。
+// 全週データは g_state.levels に保持し、ここで末尾スライスのみ描画する(再取得なしで週数変更にも対応しやすい)。
 // ----------------------------------------------------------------------------
-void PaintGrid(HDC hdc, const std::vector<int>& levels) {
-    for (size_t i = 0; i < levels.size() && i < static_cast<size_t>(GRID_WEEKS * GRID_DAYS); ++i) {
-        int week = static_cast<int>(i) / GRID_DAYS;
-        int day  = static_cast<int>(i) % GRID_DAYS;
+void PaintGrid(HDC hdc, const std::vector<int>& levels, int displayWeeks) {
+    int pitch = GetCellPitch();
+    int gridOriginY = GetGridOriginY();
+    int totalWeeks = static_cast<int>(levels.size()) / GRID_DAYS;
+    // 取得週数が displayWeeks 未満の場合は先頭から描画(データ不足時の安全側フォールバック)。
+    int startWeek = (totalWeeks > displayWeeks) ? (totalWeeks - displayWeeks) : 0;
 
-        int x = week * (CELL_SIZE + CELL_GAP);
-        int y = day  * (CELL_SIZE + CELL_GAP);
+    for (int w = 0; w < displayWeeks; ++w) {
+        for (int d = 0; d < GRID_DAYS; ++d) {
+            size_t srcIndex = static_cast<size_t>((startWeek + w) * GRID_DAYS + d);
+            if (srcIndex >= levels.size()) continue;
 
-        RECT cell{ x, y, x + CELL_SIZE, y + CELL_SIZE };
+            int x = w * pitch;
+            int y = gridOriginY + d * pitch;
+            RECT cell{ x, y, x + CELL_SIZE, y + CELL_SIZE };
 
-        int level = levels[i];
-        HBRUSH brush = CreateSolidBrush(LEVEL_COLORS[level]);
-        FillRect(hdc, &cell, brush);
-        DeleteObject(brush);
+            int level = levels[srcIndex];
+            HBRUSH brush = CreateSolidBrush(LEVEL_COLORS[level]);
+            FillRect(hdc, &cell, brush);
+            DeleteObject(brush);
+        }
     }
+
+    RECT greenRect, redRect;
+    GetControlButtonRects(displayWeeks, greenRect, redRect);
+    HBRUSH greenBrush = CreateSolidBrush(COLOR_BTN_REFRESH);
+    FillRect(hdc, &greenRect, greenBrush);
+    DeleteObject(greenBrush);
+    HBRUSH redBrush = CreateSolidBrush(COLOR_BTN_CLOSE);
+    FillRect(hdc, &redRect, redBrush);
+    DeleteObject(redBrush);
 }
 
 // ----------------------------------------------------------------------------
@@ -248,30 +391,50 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         HDC hdc = BeginPaint(hwnd, &ps);
         {
             std::lock_guard<std::mutex> lock(g_state.dataMutex);
-            PaintGrid(hdc, g_state.levels);
+            PaintGrid(hdc, g_state.levels, g_state.displayWeeks);
         }
         EndPaint(hwnd, &ps);
         return 0;
     }
 
     case WM_NCHITTEST: {
-        // クライアント領域全体をキャプション扱いにし、ドラッグでの移動をDWM既定処理に委譲する。
+        // 操作ボタンは HTCLIENT のままにし WM_LBUTTONUP を届ける。
+        // ボタン行の空白や格子領域は HTCAPTION にしてドラッグ移動を可能にする。
+        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        ScreenToClient(hwnd, &pt);
+        RECT greenRect, redRect;
+        GetControlButtonRects(g_state.displayWeeks, greenRect, redRect);
+        if (PtInRect(&greenRect, pt) || PtInRect(&redRect, pt)) {
+            return HTCLIENT;
+        }
         LRESULT hit = DefWindowProc(hwnd, msg, wParam, lParam);
         if (hit == HTCLIENT) return HTCAPTION;
         return hit;
     }
 
-    case WM_RBUTTONUP: {
-        // 右クリックで終了。タスクバー非表示(WS_EX_TOOLWINDOW)のため、
-        // 他に終了手段がないと詰むため最低限のExit手段として用意する。
-        DestroyWindow(hwnd);
-        return 0;
+    case WM_LBUTTONUP: {
+        POINT pt{ GET_X_LPARAM(lParam), GET_Y_LPARAM(lParam) };
+        RECT greenRect, redRect;
+        GetControlButtonRects(g_state.displayWeeks, greenRect, redRect);
+        if (PtInRect(&redRect, pt)) {
+            DestroyWindow(hwnd);
+            return 0;
+        }
+        if (PtInRect(&greenRect, pt)) {
+            FetchContributionsAsync(hwnd, g_state.username);
+            return 0;
+        }
+        break;
     }
 
-    case WM_DESTROY:
+    case WM_DESTROY: {
+        RECT rc;
+        GetWindowRect(hwnd, &rc);
+        SaveWindowPosition(rc.left, rc.top, g_state.displayWeeks, g_state.username);
         KillTimer(hwnd, TIMER_ID_REFRESH);
         PostQuitMessage(0);
         return 0;
+    }
     }
 
     return DefWindowProc(hwnd, msg, wParam, lParam);
@@ -282,13 +445,20 @@ LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
 // ----------------------------------------------------------------------------
 int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
-    if (!LoadConfig(g_state.username)) {
+    AppConfig config;
+    if (!LoadConfig(config)) {
         MessageBoxW(nullptr,
             L"config.txt が見つからないか、1行目にGitHubユーザー名が記述されていません。\n"
-            L"実行ファイルと同じディレクトリに config.txt を作成し、1行目にユーザー名のみを記述してください。",
+            L"実行ファイルと同じディレクトリに config.txt を作成してください。\n"
+            L"  1行目: GitHubユーザー名(必須)\n"
+            L"  2行目: 表示週数(省略時10)\n"
+            L"  3-4行目: ウィンドウ位置 X,Y(省略可。終了時に自動保存)",
             L"contrib_widget", MB_ICONERROR);
         return 1;
     }
+
+    g_state.username = config.username;
+    g_state.displayWeeks = config.displayWeeks;
 
     const wchar_t* className = L"ContribWidgetClass";
 
@@ -303,12 +473,18 @@ int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int nCmdShow) {
 
     if (!RegisterClassExW(&wc)) return 1;
 
-    int width  = GRID_WEEKS * (CELL_SIZE + CELL_GAP);
-    int height = GRID_DAYS  * (CELL_SIZE + CELL_GAP);
+    int width  = GetWindowContentWidth(g_state.displayWeeks);
+    int height = GetWindowContentHeight();
 
-    int screenW = GetSystemMetrics(SM_CXSCREEN);
-    int x = screenW - width - 20; // 画面右上、端から20px内側
-    int y = 20;
+    int x, y;
+    if (config.hasSavedPosition) {
+        x = config.windowX;
+        y = config.windowY;
+    } else {
+        int screenW = GetSystemMetrics(SM_CXSCREEN);
+        x = screenW - width - 20; // 初回のみ画面右上、端から20px内側
+        y = 20;
+    }
 
     // dwExStyle:
     //   WS_EX_LAYERED    - レイヤードウィンドウ化(透過処理の前提)
